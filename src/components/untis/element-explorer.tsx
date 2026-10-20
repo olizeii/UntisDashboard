@@ -1,6 +1,6 @@
 "use client";
 
-import { MousePointerClick } from "lucide-react";
+import { MousePointerClick, UserRoundX } from "lucide-react";
 import { useEffectiveMoment, useMomentParams } from "@/hooks/use-moment";
 import { useElementStatus, useMasterData } from "@/hooks/use-untis";
 import { ELEMENT_LABELS } from "@/lib/nav";
@@ -33,6 +33,16 @@ export function ElementExplorer({ type }: { type: ElementType }) {
 
       {master.error && !master.data ? (
         <ErrorState error={master.error} onRetry={() => master.mutate()} />
+      ) : type === "teacher" && master.data?.teachers.length === 0 ? (
+        <EmptyState
+          icon={UserRoundX}
+          title="Keine Lehrkräfte verfügbar"
+          description={
+            "Dein WebUntis-Account bekommt von Untis keine Lehrer-Daten – weder als Liste noch in den " +
+            "Stundenplänen. Das ist eine Einstellung der Schule für diese Benutzergruppe (oft bei Schüler-Accounts). " +
+            "Abhilfe: einen Account mit Lehrer-Leserechten verwenden. Details zeigt /api/untis/diagnose (im Dev-Modus)."
+          }
+        />
       ) : !id ? (
         <EmptyState
           icon={MousePointerClick}

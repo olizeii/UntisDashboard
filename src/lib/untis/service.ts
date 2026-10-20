@@ -408,3 +408,12 @@ export async function getConnectionInfo(): Promise<ConnectionInfo> {
     return { ...base, ok: false, error: toUntisError(e).toJSON() };
   }
 }
+
+/** Checks which WebUntis queries the configured account may use (bypasses the cache). */
+export async function runDiagnostics() {
+  const source = getSource();
+  return {
+    mode: source.mode,
+    checks: source.diagnose ? await source.diagnose() : [],
+  };
+}

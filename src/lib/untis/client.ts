@@ -200,4 +200,43 @@ export class UntisClient {
     session.lastUsedAt = Date.now();
     return data.result as T;
   }
+
+  /**
+   * Authenticated GET against the internal web API (as used by the WebUntis web UI),
+   * sharing the JSON-RPC session. Re-logs in once on 401/403.
+   */
+  async getJson<T>(path: string, query: Record<string, string>, retried = false): Promise<T> {
+    const session = await this.ensureSession();
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/${path}?${new URLSearchParams(query)}`, {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": `${this.config.clientName} (Next.js)`,
+          Cookie: this.cookieHeader(session.sessionId),
+        },
+        signal: AbortSignal.timeout(this.config.timeoutMs),
+        cache: "no-store",
+      });
+    } catch (error) {
+      throw toUntisError(error);
+    }
+
+    if ((response.status === 401 || response.status === 403) && !retried) {
+      this.session = null;
+      return this.getJson<T>(path, query, true);
+    }
+    if (!response.ok) {
+      throw new UntisError(
+        response.status === 403 ? "permission" : "network",
+        `WebUntis-Webabfrage fehlgeschlagen (HTTP ${response.status}).`,
+      );
+    }
+    const data = (await response.json().catch(() => null)) as T | null;
+    if (data === null) {
+      throw new UntisError("network", "WebUntis hat keine gültige JSON-Antwort geliefert.");
+    }
+    session.lastUsedAt = Date.now();
+    return data;
+  }
 }

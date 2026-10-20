@@ -1,13 +1,17 @@
 import "server-only";
 
 import {
+  addDays,
   isoToUntisDate,
+  startOfWeek,
   untisDateToIso,
   untisTimeToMinutes,
   formatMinutes,
 } from "@/lib/time";
+import { cached } from "./cache";
 import { UntisClient } from "./client";
 import type { UntisConfig } from "./config";
+import { UntisError, toUntisError } from "./errors";
 import {
   ELEMENT_TYPE_ID,
   type ElementRef,
@@ -32,6 +36,14 @@ export interface UntisDataSource {
   /** Timetable of one element for an inclusive date range (ISO dates). */
   getTimetable(type: ElementType, id: number, from: string, to: string): Promise<Lesson[]>;
   getSubstitutions(from: string, to: string): Promise<Substitution[]>;
+  /** Reports which WebUntis queries the configured account may use. */
+  diagnose?(): Promise<DiagnosticCheck[]>;
+}
+
+export interface DiagnosticCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +197,78 @@ function mapElements(type: ElementType, raw: RawElement[]): UntisElement[] {
 const REF_FIELDS = ["id", "name", "longname", "externalkey"];
 
 // ---------------------------------------------------------------------------
+// Weekly web endpoint (/api/public/timetable/weekly/data), as used by the web UI
+// ---------------------------------------------------------------------------
+
+const WEEKLY_TEACHER_TYPE = 2;
+const WEEKLY_SUBJECT_TYPE = 3;
+
+interface RawWeeklyPeriod {
+  id: number;
+  date: number;
+  startTime: number;
+  elements?: { type: number; id: number; orgId?: number }[];
+}
+
+interface RawWeeklyResponse {
+  data?: {
+    error?: { code?: number; message?: string };
+    result?: {
+      data?: {
+        elementPeriods?: Record<string, RawWeeklyPeriod[]>;
+        elements?: { type: number; id: number; name?: string; longName?: string; displayname?: string }[];
+      };
+    };
+  };
+}
+
+interface WeeklyTeacherMap {
+  periods: number;
+  /** period id -> teachers */
+  byId: Map<number, ElementRef[]>;
+  /** "date|startMin|subjectId" -> teachers (fallback when period ids differ) */
+  bySlot: Map<string, ElementRef[]>;
+}
+
+function mapWeeklyTeachers(res: RawWeeklyResponse): WeeklyTeacherMap {
+  if (res.data?.error) {
+    throw new UntisError("rpc", `Wochenansicht: ${res.data.error.message ?? "Fehler"}`, res.data.error.code);
+  }
+  const data = res.data?.result?.data;
+  const teacherNames = new Map<number, { name?: string; longName?: string }>();
+  for (const e of data?.elements ?? []) {
+    if (e.type === WEEKLY_TEACHER_TYPE) {
+      teacherNames.set(e.id, { name: e.name || e.displayname, longName: e.longName || undefined });
+    }
+  }
+
+  const result: WeeklyTeacherMap = { periods: 0, byId: new Map(), bySlot: new Map() };
+  for (const periods of Object.values(data?.elementPeriods ?? {})) {
+    for (const p of periods) {
+      result.periods++;
+      const teachers: ElementRef[] = [];
+      for (const e of p.elements ?? []) {
+        if (e.type !== WEEKLY_TEACHER_TYPE) continue;
+        const current = teacherNames.get(e.id);
+        if (!current?.name) continue; // hidden for this account
+        const changed = e.orgId && e.orgId !== e.id;
+        teachers.push({
+          id: e.id,
+          name: current.name,
+          longName: current.longName,
+          original: changed ? { id: e.orgId, name: teacherNames.get(e.orgId!)?.name ?? "?" } : undefined,
+        });
+      }
+      if (teachers.length === 0) continue;
+      const subject = (p.elements ?? []).find((e) => e.type === WEEKLY_SUBJECT_TYPE)?.id ?? 0;
+      result.byId.set(p.id, teachers);
+      result.bySlot.set(`${untisDateToIso(p.date)}|${untisTimeToMinutes(p.startTime)}|${subject}`, teachers);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Live implementation
 // ---------------------------------------------------------------------------
 
@@ -192,7 +276,7 @@ export class LiveUntisSource implements UntisDataSource {
   readonly mode = "live" as const;
   private readonly client: UntisClient;
 
-  constructor(config: UntisConfig) {
+  constructor(private readonly config: UntisConfig) {
     this.client = new UntisClient(config);
   }
 
@@ -242,7 +326,7 @@ export class LiveUntisSource implements UntisDataSource {
     return grid;
   }
 
-  async getTimetable(type: ElementType, id: number, from: string, to: string) {
+  private async rpcTimetable(type: ElementType, id: number, from: string, to: string) {
     const raw = await this.client.call<RawPeriod[]>("getTimetable", {
       options: {
         element: { id, type: ELEMENT_TYPE_ID[type] },
@@ -260,6 +344,98 @@ export class LiveUntisSource implements UntisDataSource {
       },
     });
     return raw.map(mapPeriod).sort((a, b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
+  }
+
+  async getTimetable(type: ElementType, id: number, from: string, to: string) {
+    const lessons = await this.rpcTimetable(type, id, from, to);
+    // Student accounts often get timetables without teachers via JSON-RPC. The web UI's
+    // weekly endpoint may still include them, so fill the gap from there.
+    if (lessons.length > 0 && lessons.every((l) => l.teachers.length === 0) && !this.weeklyUnavailable) {
+      await this.fillTeachersFromWeekly(type, id, lessons);
+    }
+    return lessons;
+  }
+
+  /** Set when the weekly web endpoint failed – then we stop asking for it. */
+  private weeklyUnavailable = false;
+
+  private weeklyTeachers(type: ElementType, id: number, monday: string) {
+    return cached(`weekly:${type}:${id}:${monday}`, 5 * 60_000, async () => {
+      const res = await this.client.getJson<RawWeeklyResponse>("api/public/timetable/weekly/data", {
+        elementType: String(ELEMENT_TYPE_ID[type]),
+        elementId: String(id),
+        date: monday,
+        formatId: "1",
+      });
+      return mapWeeklyTeachers(res);
+    });
+  }
+
+  private async fillTeachersFromWeekly(type: ElementType, id: number, lessons: Lesson[]) {
+    const mondays = [...new Set(lessons.map((l) => startOfWeek(l.date)))];
+    try {
+      const maps = await Promise.all(mondays.map((m) => this.weeklyTeachers(type, id, m)));
+      for (const lesson of lessons) {
+        const slot = `${lesson.date}|${lesson.startMin}|${lesson.subjects[0]?.id ?? 0}`;
+        const teachers = maps.map((m) => m.byId.get(lesson.id) ?? m.bySlot.get(slot)).find((t) => t?.length);
+        if (teachers) {
+          lesson.teachers = teachers;
+          lesson.teacherChanged = teachers.some((t) => t.original);
+        }
+      }
+    } catch (error) {
+      this.weeklyUnavailable = true;
+      console.warn(`[untis] Wochenansicht nicht verfügbar – Lehrkräfte bleiben leer: ${toUntisError(error).message}`);
+    }
+  }
+
+  async diagnose(): Promise<DiagnosticCheck[]> {
+    const checks: DiagnosticCheck[] = [];
+    const run = async (name: string, fn: () => Promise<string>) => {
+      try {
+        checks.push({ name, ok: true, detail: await fn() });
+      } catch (error) {
+        checks.push({ name, ok: false, detail: toUntisError(error).message });
+      }
+    };
+
+    let firstClass: UntisElement | undefined;
+    await run("Anmeldung", async () => {
+      await this.client.call<number>("getLatestImportTime");
+      return this.config.secret ? "per App-Secret" : "per Passwort";
+    });
+    await run("getKlassen", async () => {
+      const classes = await this.getClasses();
+      firstClass = classes[0];
+      return `${classes.length} Klassen`;
+    });
+    await run("getTeachers", async () => `${(await this.getTeachers()).length} Lehrkräfte`);
+    await run("getRooms", async () => `${(await this.getRooms()).length} Räume`);
+    await run("getSubjects", async () => `${(await this.getSubjects()).length} Gegenstände`);
+
+    // A school day: today, or next Monday on weekends
+    const today = new Date().toISOString().slice(0, 10);
+    const weekend = [0, 6].includes(new Date().getDay());
+    const day = weekend ? addDays(startOfWeek(today), 7) : today;
+    await run(`getSubstitutions (${day})`, async () => `${(await this.getSubstitutions(day, day)).length} Einträge`);
+
+    const cls = firstClass;
+    if (cls) {
+      await run(`getTimetable Klasse ${cls.name} (${day})`, async () => {
+        const lessons = await this.rpcTimetable("class", cls.id, day, day);
+        const withTeacher = lessons.filter((l) => l.teachers.length > 0).length;
+        return `${lessons.length} Stunden, davon ${withTeacher} mit Lehrkraft`;
+      });
+      await run(`Wochenansicht Klasse ${cls.name}`, async () => {
+        const map = await this.weeklyTeachers("class", cls.id, startOfWeek(day));
+        const names = [...new Set([...map.byId.values()].flat().map((t) => t.name))];
+        return (
+          `${map.periods} Stunden, davon ${map.byId.size} mit Lehrkraft` +
+          (names.length ? ` (z. B. ${names.slice(0, 3).join(", ")})` : "")
+        );
+      });
+    }
+    return checks;
   }
 
   async getSubstitutions(from: string, to: string) {
