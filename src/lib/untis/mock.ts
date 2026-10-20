@@ -1,0 +1,415 @@
+import "server-only";
+
+import { addDays, daysBetween, isoWeekday, parseTime } from "@/lib/time";
+import { deriveSubstitutions } from "./derive";
+import type { UntisDataSource } from "./source";
+import type {
+  ElementRef,
+  ElementType,
+  Lesson,
+  Substitution,
+  Timegrid,
+  TimeUnit,
+  UntisElement,
+} from "./types";
+
+// Deterministic demo school. Everything is generated from fixed seeds, so the
+// same date always produces the same timetable and the same substitutions.
+
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shuffle<T>(items: T[], rnd: () => number): T[] {
+  const a = [...items];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+const PERIODS: [string, string][] = [
+  ["08:00", "08:50"],
+  ["08:50", "09:40"],
+  ["09:55", "10:45"],
+  ["10:45", "11:35"],
+  ["11:45", "12:35"],
+  ["12:35", "13:25"],
+  ["13:30", "14:20"],
+  ["14:20", "15:10"],
+  ["15:20", "16:10"],
+  ["16:10", "17:00"],
+];
+
+const TIME_UNITS: TimeUnit[] = PERIODS.map(([start, end], i) => ({
+  name: String(i + 1),
+  start,
+  end,
+  startMin: parseTime(start),
+  endMin: parseTime(end),
+}));
+
+type RoomKind = "class" | "edv" | "lab" | "workshop" | "gym";
+
+const SUBJECTS: { name: string; longName: string; room: RoomKind }[] = [
+  { name: "D", longName: "Deutsch", room: "class" },
+  { name: "E", longName: "Englisch", room: "class" },
+  { name: "AM", longName: "Angewandte Mathematik", room: "class" },
+  { name: "GGP", longName: "Geografie, Geschichte und Politische Bildung", room: "class" },
+  { name: "RK", longName: "Religion", room: "class" },
+  { name: "BESP", longName: "Bewegung und Sport", room: "gym" },
+  { name: "NW", longName: "Naturwissenschaften", room: "lab" },
+  { name: "SEW", longName: "Softwareentwicklung", room: "edv" },
+  { name: "INSY", longName: "Informationssysteme", room: "edv" },
+  { name: "ITP", longName: "Informationstechnische Projekte", room: "edv" },
+  { name: "NWT", longName: "Netzwerktechnik", room: "edv" },
+  { name: "ET", longName: "Elektrotechnik", room: "class" },
+  { name: "ELO", longName: "Elektronik", room: "lab" },
+  { name: "WE", longName: "Werkstätte", room: "workshop" },
+  { name: "MT", longName: "Mechanik und Konstruktion", room: "class" },
+  { name: "WIR", longName: "Wirtschaft und Recht", room: "class" },
+];
+
+const CURRICULUM: Record<string, string[]> = {
+  HIT: ["D", "E", "AM", "GGP", "RK", "BESP", "NW", "SEW", "SEW", "INSY", "ITP", "NWT", "WIR"],
+  HEL: ["D", "E", "AM", "GGP", "RK", "BESP", "NW", "ET", "ET", "ELO", "ELO", "WE", "WIR"],
+  HME: ["D", "E", "AM", "GGP", "RK", "BESP", "NW", "MT", "MT", "WE", "WE", "ET", "WIR"],
+};
+
+const CLASS_NAMES = [
+  "1AHIT", "1BHIT", "2AHIT", "2BHIT", "3AHIT", "3BHIT", "4AHIT", "5AHIT",
+  "1AHEL", "2AHEL", "3AHEL", "4AHEL", "5AHEL", "1AHME", "2AHME", "3AHME",
+];
+
+const ROOMS: { name: string; longName: string; kind: RoomKind; building: string }[] = [
+  ...Array.from({ length: 9 }, (_, i) => ({
+    name: `E${101 + i}`,
+    longName: `Klassenraum E${101 + i}`,
+    kind: "class" as const,
+    building: "Haus A",
+  })),
+  ...Array.from({ length: 9 }, (_, i) => ({
+    name: `O${201 + i}`,
+    longName: `Klassenraum O${201 + i}`,
+    kind: "class" as const,
+    building: "Haus A",
+  })),
+  { name: "EDV1", longName: "EDV-Saal 1", kind: "edv", building: "Haus B" },
+  { name: "EDV2", longName: "EDV-Saal 2", kind: "edv", building: "Haus B" },
+  { name: "EDV3", longName: "EDV-Saal 3", kind: "edv", building: "Haus B" },
+  { name: "EDV4", longName: "EDV-Saal 4", kind: "edv", building: "Haus B" },
+  { name: "LAB1", longName: "Physiklabor", kind: "lab", building: "Haus B" },
+  { name: "LAB2", longName: "Elektroniklabor", kind: "lab", building: "Haus B" },
+  { name: "LAB3", longName: "Chemielabor", kind: "lab", building: "Haus B" },
+  { name: "WS1", longName: "Werkstätte Metall", kind: "workshop", building: "Werkstättentrakt" },
+  { name: "WS2", longName: "Werkstätte Elektro", kind: "workshop", building: "Werkstättentrakt" },
+  { name: "TS1", longName: "Turnsaal 1", kind: "gym", building: "Sporthalle" },
+  { name: "TS2", longName: "Turnsaal 2", kind: "gym", building: "Sporthalle" },
+];
+
+const TEACHERS: [abbr: string, last: string, first: string, subjects: string[]][] = [
+  ["HUB", "Huber", "Maria", ["D", "GGP"]],
+  ["GRU", "Gruber", "Thomas", ["AM", "NW"]],
+  ["WAG", "Wagner", "Sabine", ["E", "D"]],
+  ["BAU", "Bauer", "Michael", ["SEW", "INSY"]],
+  ["PIC", "Pichler", "Andrea", ["E", "GGP"]],
+  ["STE", "Steiner", "Lukas", ["SEW", "ITP"]],
+  ["MOS", "Moser", "Claudia", ["AM", "WIR"]],
+  ["MAY", "Mayer", "Florian", ["NWT", "ITP"]],
+  ["HOF", "Hofer", "Julia", ["D", "RK"]],
+  ["LEI", "Leitner", "Stefan", ["BESP", "NW"]],
+  ["BER", "Berger", "Katharina", ["E", "WIR"]],
+  ["FU", "Fuchs", "Daniel", ["ET", "ELO"]],
+  ["ED", "Eder", "Martina", ["AM", "ET"]],
+  ["FIS", "Fischer", "Markus", ["WE", "MT"]],
+  ["SMI", "Schmid", "Elisabeth", ["GGP", "D"]],
+  ["WIN", "Winkler", "Patrick", ["INSY", "SEW"]],
+  ["WEB", "Weber", "Birgit", ["NW", "AM"]],
+  ["SWZ", "Schwarz", "Alexander", ["ELO", "WE"]],
+  ["MAI", "Maier", "Christina", ["E", "RK"]],
+  ["REI", "Reiter", "Bernhard", ["BESP"]],
+  ["SUS", "Schuster", "Verena", ["D", "E"]],
+  ["LA", "Lang", "Wolfgang", ["MT", "AM"]],
+  ["BGT", "Baumgartner", "Lisa", ["ITP", "NWT"]],
+  ["WO", "Wolf", "Georg", ["WE", "ET"]],
+  ["BRU", "Brunner", "Eva", ["WIR", "GGP"]],
+  ["AU", "Auer", "Johannes", ["SEW", "NWT"]],
+  ["WIM", "Wimmer", "Sandra", ["AM", "NW"]],
+  ["EGG", "Egger", "Martin", ["ELO", "ET"]],
+  ["AIG", "Aigner", "Barbara", ["BESP", "RK"]],
+  ["LEC", "Lechner", "Peter", ["MT", "WE"]],
+  ["HAA", "Haas", "Monika", ["D", "GGP"]],
+  ["KOL", "Koller", "Andreas", ["INSY", "ITP"]],
+  ["STR", "Strasser", "Nina", ["E", "AM"]],
+  ["HOL", "Holzer", "Robert", ["SEW", "AM"]],
+];
+
+const subjects: UntisElement[] = SUBJECTS.map((s, i) => ({
+  id: 300 + i,
+  type: "subject",
+  name: s.name,
+  longName: s.longName,
+}));
+const classes: UntisElement[] = CLASS_NAMES.map((name, i) => ({
+  id: 100 + i,
+  type: "class",
+  name,
+  longName: `${name.slice(0, 1)}. Jahrgang ${name.slice(2)}`,
+}));
+const rooms: UntisElement[] = ROOMS.map((r, i) => ({
+  id: 400 + i,
+  type: "room",
+  name: r.name,
+  longName: r.longName,
+  building: r.building,
+}));
+const teachers: UntisElement[] = TEACHERS.map(([abbr, last, first], i) => ({
+  id: 200 + i,
+  type: "teacher",
+  name: abbr,
+  longName: `${last} ${first}`,
+}));
+
+const ref = (e: UntisElement): ElementRef => ({ id: e.id, name: e.name, longName: e.longName });
+const subjectByName = new Map(SUBJECTS.map((s, i) => [s.name, { ...s, el: subjects[i] }]));
+const teachersBySubject = new Map<string, number[]>();
+TEACHERS.forEach(([, , , subs], i) => {
+  for (const s of subs) teachersBySubject.set(s, [...(teachersBySubject.get(s) ?? []), i]);
+});
+
+interface PlannedLesson {
+  classIdx: number;
+  period: number;
+  subject: string;
+  teacherIdx: number;
+  roomIdx: number;
+}
+
+/** Weekly base plan, generated once per weekday. */
+function buildWeekday(weekday: number): PlannedLesson[] {
+  const rnd = mulberry32(4711 + weekday * 97);
+  const homeRoom = (c: number) => c; // classes 0..15 use E101…O207
+  const busyTeachers = PERIODS.map(() => new Set<number>());
+  const busyRooms = PERIODS.map(() => new Set<number>());
+  const plan: PlannedLesson[] = [];
+
+  for (const classIdx of shuffle(
+    CLASS_NAMES.map((_, i) => i),
+    rnd,
+  )) {
+    const dept = CLASS_NAMES[classIdx].slice(2);
+    const curriculum = CURRICULUM[dept];
+    const firstPeriod = rnd() < 0.15 ? 1 : 0;
+    const lastPeriod = Math.min(PERIODS.length, 5 + Math.floor(rnd() * 5));
+    const gap = rnd() < 0.3 ? 5 : -1; // optional lunch gap in period 6
+
+    let p = firstPeriod;
+    while (p < lastPeriod) {
+      if (p === gap) {
+        p++;
+        continue;
+      }
+      const subject = curriculum[Math.floor(rnd() * curriculum.length)];
+      const kind = subjectByName.get(subject)!.room;
+      const length = kind === "class" && rnd() < 0.6 ? 1 : 2;
+      const span = Array.from({ length }, (_, k) => p + k).filter((x) => x < lastPeriod);
+
+      const teacherIdx = shuffle(teachersBySubject.get(subject) ?? [], rnd).find((t) =>
+        span.every((x) => !busyTeachers[x].has(t)),
+      );
+      const roomCandidates =
+        kind === "class"
+          ? [homeRoom(classIdx)]
+          : shuffle(
+              ROOMS.map((r, i) => (r.kind === kind ? i : -1)).filter((i) => i >= 0),
+              rnd,
+            );
+      const roomIdx = roomCandidates.find((r) => span.every((x) => !busyRooms[x].has(r)));
+
+      if (teacherIdx === undefined || roomIdx === undefined) {
+        p++; // no free teacher/room – the class simply has a free period
+        continue;
+      }
+      for (const x of span) {
+        busyTeachers[x].add(teacherIdx);
+        busyRooms[x].add(roomIdx);
+        plan.push({ classIdx, period: x, subject, teacherIdx, roomIdx });
+      }
+      p += span.length;
+    }
+  }
+  return plan;
+}
+
+const weekPlan = new Map<number, PlannedLesson[]>();
+const dayCache = new Map<string, Lesson[]>();
+
+function lessonsForDate(date: string): Lesson[] {
+  const cached = dayCache.get(date);
+  if (cached) return cached;
+
+  const weekday = isoWeekday(date);
+  if (weekday > 5) return [];
+  if (!weekPlan.has(weekday)) weekPlan.set(weekday, buildWeekday(weekday));
+  const plan = weekPlan.get(weekday)!;
+
+  const dateNum = Number(date.replaceAll("-", ""));
+  const rnd = mulberry32(dateNum);
+  const busyTeachers = PERIODS.map(() => new Set<number>());
+  const busyRooms = PERIODS.map(() => new Set<number>());
+  for (const l of plan) {
+    busyTeachers[l.period].add(l.teacherIdx);
+    busyRooms[l.period].add(l.roomIdx);
+  }
+
+  // Decide changes per (class, subject, teacher) block so double periods change together.
+  const decisions = new Map<string, { kind: number; teacher?: number; room?: number }>();
+
+  const lessons = plan.map((l, index): Lesson => {
+    const unit = TIME_UNITS[l.period];
+    const blockKey = `${l.classIdx}-${l.subject}-${l.teacherIdx}`;
+    let d = decisions.get(blockKey);
+    if (!d) {
+      const r = rnd();
+      d = { kind: r < 0.04 ? 1 : r < 0.1 ? 2 : r < 0.13 ? 3 : 0 };
+      decisions.set(blockKey, d);
+    }
+
+    let teacherIdx = l.teacherIdx;
+    let roomIdx = l.roomIdx;
+    let teacherChanged = false;
+    let roomChanged = false;
+
+    if (d.kind === 2) {
+      d.teacher ??= shuffle(
+        TEACHERS.map((_, i) => i),
+        rnd,
+      ).find((t) => !busyTeachers[l.period].has(t));
+      if (d.teacher !== undefined && !busyTeachers[l.period].has(d.teacher)) {
+        busyTeachers[l.period].add(d.teacher);
+        teacherIdx = d.teacher;
+        teacherChanged = true;
+      }
+    } else if (d.kind === 3) {
+      const kind = ROOMS[l.roomIdx].kind;
+      d.room ??= shuffle(
+        ROOMS.map((r, i) => (r.kind === kind ? i : -1)).filter((i) => i >= 0),
+        rnd,
+      ).find((r) => !busyRooms[l.period].has(r));
+      if (d.room !== undefined && !busyRooms[l.period].has(d.room)) {
+        busyRooms[l.period].add(d.room);
+        roomIdx = d.room;
+        roomChanged = true;
+      }
+    }
+
+    const subject = subjectByName.get(l.subject)!;
+    const teacherRef = ref(teachers[teacherIdx]);
+    const roomRef = ref(rooms[roomIdx]);
+    if (teacherChanged) teacherRef.original = { id: teachers[l.teacherIdx].id, name: teachers[l.teacherIdx].name };
+    if (roomChanged) roomRef.original = { id: rooms[l.roomIdx].id, name: rooms[l.roomIdx].name };
+
+    return {
+      id: dateNum * 1000 + index,
+      date,
+      start: unit.start,
+      end: unit.end,
+      startMin: unit.startMin,
+      endMin: unit.endMin,
+      classes: [ref(classes[l.classIdx])],
+      teachers: [teacherRef],
+      subjects: [ref(subject.el)],
+      rooms: [roomRef],
+      status: d.kind === 1 ? "cancelled" : teacherChanged || roomChanged ? "irregular" : "regular",
+      lessonType: "ls",
+      substText:
+        d.kind === 1
+          ? "Entfall – Lehrkraft verhindert"
+          : teacherChanged
+            ? "Vertretung"
+            : roomChanged
+              ? "Raumänderung"
+              : undefined,
+      teacherChanged,
+      roomChanged,
+    };
+  });
+
+  lessons.sort((a, b) => a.startMin - b.startMin || a.classes[0].name.localeCompare(b.classes[0].name));
+  dayCache.set(date, lessons);
+  return lessons;
+}
+
+function matches(lesson: Lesson, type: ElementType, id: number) {
+  const list =
+    type === "teacher"
+      ? lesson.teachers
+      : type === "class"
+        ? lesson.classes
+        : type === "room"
+          ? lesson.rooms
+          : lesson.subjects;
+  return list.some((e) => e.id === id);
+}
+
+function* dateRange(from: string, to: string) {
+  const n = Math.min(daysBetween(from, to), 62);
+  for (let i = 0; i <= n; i++) yield addDays(from, i);
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export class MockUntisSource implements UntisDataSource {
+  readonly mode = "demo" as const;
+  readonly sessionSince = Date.now();
+
+  async checkConnection() {
+    await delay(120);
+  }
+
+  async getTeachers() {
+    await delay(150);
+    return teachers;
+  }
+
+  async getClasses() {
+    await delay(150);
+    return classes;
+  }
+
+  async getRooms() {
+    await delay(150);
+    return rooms;
+  }
+
+  async getSubjects() {
+    return subjects;
+  }
+
+  async getTimegrid(): Promise<Timegrid> {
+    return { 1: TIME_UNITS, 2: TIME_UNITS, 3: TIME_UNITS, 4: TIME_UNITS, 5: TIME_UNITS };
+  }
+
+  async getTimetable(type: ElementType, id: number, from: string, to: string) {
+    await delay(200 + (id % 5) * 40);
+    const result: Lesson[] = [];
+    for (const date of dateRange(from, to)) {
+      result.push(...lessonsForDate(date).filter((l) => matches(l, type, id)));
+    }
+    return result;
+  }
+
+  async getSubstitutions(from: string, to: string): Promise<Substitution[]> {
+    await delay(250);
+    const lessons = [...dateRange(from, to)].flatMap(lessonsForDate);
+    return deriveSubstitutions(lessons);
+  }
+}
