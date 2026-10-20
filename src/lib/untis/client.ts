@@ -82,7 +82,12 @@ export class UntisClient {
       throw toUntisError(error);
     }
 
+    const data = (await response.json().catch(() => null)) as RpcResponse<T> | null;
+
     if (!response.ok) {
+      // Untis answers some errors (e.g. -8500 invalid school) with HTTP 404 + a JSON-RPC
+      // error body – that message is more precise than the status code.
+      if (data?.error) throw UntisError.fromRpc(data.error.code, data.error.message);
       throw new UntisError(
         response.status === 404 ? "config" : "network",
         response.status === 404
@@ -90,16 +95,10 @@ export class UntisClient {
           : `WebUntis-Server antwortet mit HTTP ${response.status}.`,
       );
     }
-
-    let data: RpcResponse<T>;
-    try {
-      data = (await response.json()) as RpcResponse<T>;
-    } catch (error) {
+    if (!data) {
       throw new UntisError(
         "network",
         "WebUntis hat keine gültige JSON-Antwort geliefert (Wartungsarbeiten oder falscher Server?).",
-        undefined,
-        { cause: error },
       );
     }
     return { data, response };

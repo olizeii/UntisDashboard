@@ -53,7 +53,12 @@ export class UntisError extends Error {
       case UNTIS_ERROR_CODES.USER_BLOCKED:
         return new UntisError("auth", "Der WebUntis-Benutzer ist gesperrt.", code);
       case UNTIS_ERROR_CODES.INVALID_SCHOOL:
-        return new UntisError("config", "Der Schulname ist auf diesem Server unbekannt.", code);
+        return new UntisError(
+          "config",
+          "Der Schulname (UNTIS_SCHOOL) ist auf diesem Server unbekannt. Gemeint ist der Login-Name " +
+            "der Schule – er steht in der WebUntis-URL nach ?school= bzw. #/basic/login.",
+          code,
+        );
       case UNTIS_ERROR_CODES.NOT_AUTHENTICATED:
         return new UntisError("auth", "Die WebUntis-Session ist abgelaufen.", code);
       case UNTIS_ERROR_CODES.NO_RIGHT:
