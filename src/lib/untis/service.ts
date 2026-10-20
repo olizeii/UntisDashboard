@@ -115,32 +115,36 @@ async function loadMasterData(): Promise<MasterData> {
     ),
   ]);
 
-  let teachers: UntisElement[] = [];
-  let rooms: UntisElement[] = [];
-  let teacherSource: MasterData["teacherSource"] = "api";
-
-  const needsDerived =
-    (!teachersResult.ok && isPermissionError(teachersResult.error)) ||
-    (!roomsResult.ok && isPermissionError(roomsResult.error));
   for (const r of [teachersResult, roomsResult]) {
     if (!r.ok && !isPermissionError(r.error)) throw r.error;
   }
+  // Some accounts get a permission error, others simply an empty list.
+  let teachers = teachersResult.ok ? teachersResult.value : [];
+  let rooms = roomsResult.ok ? roomsResult.value : [];
+  let teacherSource: MasterData["teacherSource"] = "api";
+  const monday = startOfWeek(resolveMoment().date);
 
-  if (needsDerived) {
+  if (teachers.length === 0 && source.listTeachersFromWeekly) {
+    try {
+      teachers = await source.listTeachersFromWeekly(classes.map((c) => c.id), monday);
+      teacherSource = "derived";
+    } catch (error) {
+      console.warn(`[untis] Lehrerliste aus Wochenansicht nicht möglich: ${toUntisError(error).message}`);
+    }
+  }
+
+  if (teachers.length === 0 || rooms.length === 0) {
     // Reconstruct missing master data from this week's class timetables.
-    const monday = startOfWeek(resolveMoment().date);
     const week = await Promise.all(
       [0, 1, 2, 3, 4].map((i) => aggregateDay(addDays(monday, i), classes)),
     );
     const lessons = week.flat();
-    if (!teachersResult.ok) {
+    if (teachers.length === 0) {
       teachers = deriveElements("teacher", lessons);
       teacherSource = "derived";
     }
-    if (!roomsResult.ok) rooms = deriveElements("room", lessons);
+    if (rooms.length === 0) rooms = deriveElements("room", lessons);
   }
-  if (teachersResult.ok) teachers = teachersResult.value;
-  if (roomsResult.ok) rooms = roomsResult.value;
 
   return { teachers, classes, rooms, subjects, timegrid, teacherSource };
 }
@@ -225,7 +229,11 @@ export async function getElementLessons(
   const source = getSource();
   if (type === "class") return getClassTimetable(source, id, date);
 
-  if (!denied.has(type)) {
+  // A derived teacher list means the account can't query teachers directly – such
+  // queries tend to return empty timetables instead of an error, so don't trust them.
+  const skipDirect = type === "teacher" && (await getMasterData()).teacherSource === "derived";
+
+  if (!skipDirect && !denied.has(type)) {
     try {
       return await cached(`tt:${type}:${id}:${date}`, dayTtl(date), () =>
         source.getTimetable(type, id, date, date),

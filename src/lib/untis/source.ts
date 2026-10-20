@@ -8,7 +8,7 @@ import {
   untisTimeToMinutes,
   formatMinutes,
 } from "@/lib/time";
-import { cached } from "./cache";
+import { cached, mapLimit } from "./cache";
 import { UntisClient } from "./client";
 import type { UntisConfig } from "./config";
 import { UntisError, toUntisError } from "./errors";
@@ -38,6 +38,8 @@ export interface UntisDataSource {
   getSubstitutions(from: string, to: string): Promise<Substitution[]>;
   /** Reports which WebUntis queries the configured account may use. */
   diagnose?(): Promise<DiagnosticCheck[]>;
+  /** Teacher list from the weekly timetables of the given classes (when getTeachers is empty). */
+  listTeachersFromWeekly?(classIds: number[], monday: string): Promise<UntisElement[]>;
 }
 
 export interface DiagnosticCheck {
@@ -224,6 +226,8 @@ interface RawWeeklyResponse {
 
 interface WeeklyTeacherMap {
   periods: number;
+  /** All teachers listed in the response */
+  teachers: UntisElement[];
   /** period id -> teachers */
   byId: Map<number, ElementRef[]>;
   /** "date|startMin|subjectId" -> teachers (fallback when period ids differ) */
@@ -242,7 +246,14 @@ function mapWeeklyTeachers(res: RawWeeklyResponse): WeeklyTeacherMap {
     }
   }
 
-  const result: WeeklyTeacherMap = { periods: 0, byId: new Map(), bySlot: new Map() };
+  const result: WeeklyTeacherMap = {
+    periods: 0,
+    teachers: [...teacherNames]
+      .filter(([, t]) => t.name)
+      .map(([id, t]) => ({ id, type: "teacher" as const, name: t.name!, longName: t.longName })),
+    byId: new Map(),
+    bySlot: new Map(),
+  };
   for (const periods of Object.values(data?.elementPeriods ?? {})) {
     for (const p of periods) {
       result.periods++;
@@ -350,14 +361,14 @@ export class LiveUntisSource implements UntisDataSource {
     const lessons = await this.rpcTimetable(type, id, from, to);
     // Student accounts often get timetables without teachers via JSON-RPC. The web UI's
     // weekly endpoint may still include them, so fill the gap from there.
-    if (lessons.length > 0 && lessons.every((l) => l.teachers.length === 0) && !this.weeklyUnavailable) {
+    if (lessons.length > 0 && lessons.every((l) => l.teachers.length === 0) && !this.weeklyUnavailable.has(type)) {
       await this.fillTeachersFromWeekly(type, id, lessons);
     }
     return lessons;
   }
 
-  /** Set when the weekly web endpoint failed – then we stop asking for it. */
-  private weeklyUnavailable = false;
+  /** Element types for which the weekly web endpoint failed – we stop asking for those. */
+  private weeklyUnavailable = new Set<ElementType>();
 
   private weeklyTeachers(type: ElementType, id: number, monday: string) {
     return cached(`weekly:${type}:${id}:${monday}`, 5 * 60_000, async () => {
@@ -384,9 +395,24 @@ export class LiveUntisSource implements UntisDataSource {
         }
       }
     } catch (error) {
-      this.weeklyUnavailable = true;
+      this.weeklyUnavailable.add(type);
       console.warn(`[untis] Wochenansicht nicht verfügbar – Lehrkräfte bleiben leer: ${toUntisError(error).message}`);
     }
+  }
+
+  async listTeachersFromWeekly(classIds: number[], monday: string): Promise<UntisElement[]> {
+    const results = await mapLimit(classIds, this.config.maxConcurrency, (id) =>
+      this.weeklyTeachers("class", id, monday),
+    );
+    const failures = results.filter((r) => r.status === "rejected");
+    if (failures.length > 0 && failures.length === results.length) {
+      throw (failures[0] as PromiseRejectedResult).reason;
+    }
+    const byId = new Map<number, UntisElement>();
+    for (const r of results) {
+      if (r.status === "fulfilled") for (const t of r.value.teachers) byId.set(t.id, t);
+    }
+    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name, "de"));
   }
 
   async diagnose(): Promise<DiagnosticCheck[]> {
