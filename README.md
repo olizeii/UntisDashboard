@@ -44,6 +44,8 @@ Stundenpläne mit täglich wechselnden Entfällen, Vertretungen und Raumänderun
 | `UNTIS_TIMEZONE` | | Zeitzone der Schule, Standard `Europe/Vienna` (wichtig, wenn der Server in UTC läuft) |
 | `UNTIS_TIMEOUT_MS` | | Timeout pro Untis-Request (Standard 15000) |
 | `UNTIS_MAX_CONCURRENCY` | | Max. parallele Requests beim Zusammensetzen der Tagesübersicht (Standard 6) |
+| `TEACHER_DIRECTORY_URL` | | Lehrerverzeichnis für volle Namen, falls WebUntis nur Kürzel liefert (siehe unten) |
+| `UNTIS_TEACHER_NAMES` | | Manuelle Namenszuordnung, z. B. `EDER=Eder Markus; KAI=Kainz Sarah` |
 | `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | | Aktiviert HTTP-Basic-Auth für die ganze App |
 
 ¹ Entweder Passwort oder Secret.
@@ -59,12 +61,22 @@ Welche Daten abrufbar sind, hängt von den Rechten des Accounts ab. Die App geht
 
 - **Lehrer-/Raum-Stundenpläne direkt nicht erlaubt?** (`-8509`) → Die App setzt den Tag aus den
   Stundenplänen aller Klassen zusammen und filtert daraus (dedupliziert, parallel, gecacht).
-- **`getTeachers` / `getRooms` nicht erlaubt?** → Lehrer- und Raumliste werden aus den
-  Stundenplänen der aktuellen Woche abgeleitet.
+- **`getTeachers` / `getRooms` nicht erlaubt oder leer?** → Die Lehrerliste kommt aus der
+  Wochenansicht der Klassen (wie in der WebUntis-Weboberfläche), Räume aus den Stundenplänen.
+- **Stundenpläne ohne Lehrkräfte?** (häufig bei Schüler-Accounts) → Lehrkräfte werden pro Stunde
+  aus der Wochenansicht ergänzt.
+- **Nur Kürzel, keine Namen?** → Mit `TEACHER_DIRECTORY_URL` lädt die App ein Lehrerverzeichnis
+  (z. B. von der Schulwebseite, 24 h gecacht) und ordnet die Kürzel per Namensähnlichkeit zu:
+  gleicher Nachname → Nachnamen-Anfang → Nachname + Vorname-Initiale → Buchstabenfolge. Eindeutige
+  Zuordnungen schränken die übrigen ein; bei echten Mehrdeutigkeiten wird nur der sichere Teil
+  (z. B. „Eder“) angezeigt. Unsichere Treffer sind im Lehrerverzeichnis markiert und lassen sich
+  mit `UNTIS_TEACHER_NAMES` korrigieren. Die Namen werden nur zur Laufzeit geladen, nicht im Repo
+  gespeichert.
 - **`getSubstitutions` nicht erlaubt?** → Der Vertretungsplan wird aus den Stundenplan-Einträgen
   abgeleitet (Hinweis in der UI).
 
 Am besten funktioniert ein eigener Lese-Account mit Rechten auf Lehrer- und Raumstundenpläne.
+Im Dev-Modus zeigt `/api/untis/diagnose`, welche Abfragen der Account darf.
 
 ## Architektur
 

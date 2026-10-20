@@ -7,6 +7,8 @@ import { deriveSubstitutions } from "./derive";
 import { UntisError, toUntisError } from "./errors";
 import { MockUntisSource } from "./mock";
 import { computeStatus } from "./status";
+import { loadTeacherDirectory } from "./teacher-directory";
+import { matchTeacherNames, parseOverrides, type DirectoryEntry } from "./teacher-names";
 import { LiveUntisSource, type UntisDataSource } from "./source";
 import type {
   ConnectionInfo,
@@ -146,7 +148,62 @@ async function loadMasterData(): Promise<MasterData> {
     if (rooms.length === 0) rooms = deriveElements("room", lessons);
   }
 
-  return { teachers, classes, rooms, subjects, timegrid, teacherSource };
+  const named = await nameTeachers(teachers);
+  return { teachers: named.teachers, classes, rooms, subjects, timegrid, teacherSource, teacherNames: named.info };
+}
+
+/**
+ * Fills in full names for teachers that only have an abbreviation, using the staff
+ * directory (TEACHER_DIRECTORY_URL) and manual overrides (UNTIS_TEACHER_NAMES).
+ */
+async function nameTeachers(
+  teachers: UntisElement[],
+): Promise<{ teachers: UntisElement[]; info: MasterData["teacherNames"] }> {
+  const hasName = (t: UntisElement) => !!t.longName && t.longName !== t.name;
+  const unnamed = teachers.filter((t) => !hasName(t));
+  const alreadyNamed = teachers.length - unnamed.length;
+  if (unnamed.length === 0) {
+    return { teachers, info: { source: "untis", named: alreadyNamed, uncertain: 0 } };
+  }
+
+  const overrides = parseOverrides(process.env.UNTIS_TEACHER_NAMES);
+  let directory: DirectoryEntry[] = [];
+  let error: string | undefined;
+  try {
+    directory = await loadTeacherDirectory();
+  } catch (e) {
+    error = `Lehrerverzeichnis nicht ladbar: ${e instanceof Error ? e.message : String(e)}`;
+    console.warn(`[untis] ${error}`);
+  }
+  if (directory.length === 0 && Object.keys(overrides).length === 0) {
+    return { teachers, info: { source: "none", named: alreadyNamed, uncertain: 0, error } };
+  }
+
+  const matches = matchTeacherNames(unnamed.map((t) => t.name), directory, overrides);
+  let named = alreadyNamed;
+  let uncertain = 0;
+  const result = teachers.map((t) => {
+    const match = hasName(t) ? undefined : matches.get(t.name);
+    if (!match) return t;
+    const unsure = !!match.partial || match.confidence === "medium" || match.confidence === "low";
+    named++;
+    if (unsure) uncertain++;
+    return { ...t, longName: match.longName, nameUncertain: unsure || undefined };
+  });
+  return { teachers: result, info: { source: "directory", named, uncertain, error } };
+}
+
+/** Copies teacher full names from the master data into lesson / substitution refs. */
+async function withTeacherNames<T extends { teachers: ElementRef[] }>(items: T[]): Promise<T[]> {
+  const { teachers } = await getMasterData();
+  const byId = new Map(teachers.map((t) => [t.id, t]));
+  for (const item of items) {
+    for (const ref of item.teachers) {
+      const longName = byId.get(ref.id)?.longName;
+      if (longName && (!ref.longName || ref.longName === ref.name)) ref.longName = longName;
+    }
+  }
+  return items;
 }
 
 export function getMasterData(): Promise<MasterData> {
@@ -201,7 +258,7 @@ function getClassTimetable(source: UntisDataSource, id: number, date: string) {
 
 export async function getDayLessons(date: string): Promise<Lesson[]> {
   const master = await getMasterData();
-  return aggregateDay(date, master.classes);
+  return withTeacherNames(await aggregateDay(date, master.classes));
 }
 
 function refsOf(lesson: Lesson, type: ElementType): ElementRef[] {
@@ -227,7 +284,7 @@ export async function getElementLessons(
   date: string,
 ): Promise<Lesson[]> {
   const source = getSource();
-  if (type === "class") return getClassTimetable(source, id, date);
+  if (type === "class") return withTeacherNames(await getClassTimetable(source, id, date));
 
   // A derived teacher list means the account can't query teachers directly – such
   // queries tend to return empty timetables instead of an error, so don't trust them.
@@ -235,9 +292,10 @@ export async function getElementLessons(
 
   if (!skipDirect && !denied.has(type)) {
     try {
-      return await cached(`tt:${type}:${id}:${date}`, dayTtl(date), () =>
+      const lessons = await cached(`tt:${type}:${id}:${date}`, dayTtl(date), () =>
         source.getTimetable(type, id, date, date),
       );
+      return await withTeacherNames(lessons);
     } catch (error) {
       if (!isPermissionError(error)) throw error;
       denied.add(type);
@@ -320,6 +378,12 @@ export interface SubstitutionResult {
 }
 
 export async function getSubstitutions(from: string, to: string): Promise<SubstitutionResult> {
+  const result = await loadSubstitutions(from, to);
+  await withTeacherNames(result.items);
+  return result;
+}
+
+function loadSubstitutions(from: string, to: string): Promise<SubstitutionResult> {
   return cached(`subst:${from}:${to}`, TTL.substitutions, async () => {
     const source = getSource();
     if (!denied.has("substitutions")) {

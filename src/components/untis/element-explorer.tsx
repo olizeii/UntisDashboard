@@ -11,6 +11,7 @@ import { EmptyState } from "./empty-state";
 import { ErrorState } from "./error-state";
 import { LiveStatusCard, LiveStatusSkeleton } from "./live-status-card";
 import { MomentControls } from "./moment-controls";
+import { TeacherDirectory } from "./teacher-directory";
 
 /**
  * Search + live status + day plan for one teacher, class or room.
@@ -27,7 +28,7 @@ export function ElementExplorer({ type }: { type: ElementType }) {
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <ElementPicker type={type} value={id} onSelect={(el) => update({ id: el.id })} autoOpen />
+        <ElementPicker type={type} value={id} onSelect={(el) => update({ id: el.id })} autoOpen={type !== "teacher"} />
         <MomentControls moment={moment} time={time} onChange={update} />
       </div>
 
@@ -42,6 +43,12 @@ export function ElementExplorer({ type }: { type: ElementType }) {
             "Stundenplänen. Das ist eine Einstellung der Schule für diese Benutzergruppe (oft bei Schüler-Accounts). " +
             "Abhilfe: einen Account mit Lehrer-Leserechten verwenden. Details zeigt /api/untis/diagnose (im Dev-Modus)."
           }
+        />
+      ) : !id && type === "teacher" && master.data ? (
+        <TeacherDirectory
+          teachers={master.data.teachers}
+          info={master.data.teacherNames}
+          onSelect={(t) => update({ id: t.id })}
         />
       ) : !id ? (
         <EmptyState

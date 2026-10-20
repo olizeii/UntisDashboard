@@ -86,20 +86,29 @@ export function LessonBadges({ lesson }: { lesson: Lesson }) {
   );
 }
 
+/** "Kalab Marie-Theres" -> "Kalab M." (single word names stay as they are) */
+export function shortPersonName(longName: string) {
+  const [surname, first] = longName.split(" ");
+  return first ? `${surname} ${first[0]}.` : surname;
+}
+
 /**
  * Renders a list of element references, linked to their detail page.
  * Changed elements show the original one struck through.
+ * Teachers show a short name next to the abbreviation (`names`).
  */
 export function RefList({
   refs,
   type,
   long = false,
+  names = type === "teacher",
   date,
   className,
 }: {
   refs: ElementRef[];
   type: ElementType;
   long?: boolean;
+  names?: boolean;
   date?: string;
   className?: string;
 }) {
@@ -122,6 +131,9 @@ export function RefList({
               </Link>
             ) : (
               <span title={r.longName}>{label}</span>
+            )}
+            {names && !long && r.longName && r.longName !== r.name && (
+              <span className="text-muted-foreground font-normal">{shortPersonName(r.longName)}</span>
             )}
             {i < refs.length - 1 && <span className="text-muted-foreground">,</span>}
           </span>

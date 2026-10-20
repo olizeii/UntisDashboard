@@ -82,7 +82,7 @@ function Fact({ icon: Icon, label, refs, type, date, primary }: {
         <Icon className="size-3.5" /> {label}
       </p>
       <p className={cn("font-semibold break-words", primary ? "text-3xl sm:text-4xl" : "text-xl")}>
-        <RefList refs={refs} type={type} date={date} />
+        <RefList refs={refs} type={type} date={date} names={false} />
       </p>
       {refs[0]?.longName && refs[0].longName !== refs[0].name && (
         <p className="text-muted-foreground truncate text-sm">{refs.map((r) => r.longName ?? r.name).join(", ")}</p>

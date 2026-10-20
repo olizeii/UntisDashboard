@@ -445,6 +445,12 @@ export class LiveUntisSource implements UntisDataSource {
     const day = weekend ? addDays(startOfWeek(today), 7) : today;
     await run(`getSubstitutions (${day})`, async () => `${(await this.getSubstitutions(day, day)).length} Einträge`);
 
+    await run("Lehrerverzeichnis (TEACHER_DIRECTORY_URL)", async () => {
+      const { loadTeacherDirectory } = await import("./teacher-directory");
+      const entries = await loadTeacherDirectory();
+      return entries.length ? `${entries.length} Namen geladen` : "nicht konfiguriert";
+    });
+
     const cls = firstClass;
     if (cls) {
       await run(`getTimetable Klasse ${cls.name} (${day})`, async () => {

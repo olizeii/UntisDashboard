@@ -20,6 +20,8 @@ export interface UntisElement {
   longName?: string;
   /** Extra info for rooms (building) */
   building?: string;
+  /** Teacher name was matched heuristically and may be wrong / incomplete */
+  nameUncertain?: boolean;
 }
 
 export interface ElementRef {
@@ -105,6 +107,13 @@ export interface MasterData {
   timegrid: Timegrid;
   /** "api" = from master data endpoints, "derived" = reconstructed from timetables */
   teacherSource: "api" | "derived";
+  /** Where teacher full names come from */
+  teacherNames: {
+    source: "untis" | "directory" | "none";
+    named: number;
+    uncertain: number;
+    error?: string;
+  };
 }
 
 export type ElementState =
